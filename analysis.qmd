@@ -1,0 +1,1095 @@
+---
+title: "Predicting pre-diabetes under class imbalance"
+author: "Nishith Ranjon Roy (Pritom)"
+format: html
+editor_options: 
+  chunk_output_type: inline
+---
+```{r include=FALSE}
+knitr::opts_chunk$set(echo = FALSE,warning = FALSE,message = FALSE)
+library(tidyverse)
+library(tidymodels)
+library(themis)
+library(future)
+theme_set(theme_classic())
+theme_update(plot.title = element_text(hjust = .5))
+df <- read_csv("data/Dataset of Diabetes.csv") |> 
+  select(-c(ID, No_Pation)) |> 
+  mutate(Gender = tolower(Gender),
+         CLASS = str_trim(CLASS)) |> 
+  distinct()
+```
+
+There are 1000 patients and cover three classes (Diabetic, Non-Diabetic, and Predicted-Diabetic). The group in predicted class do not yet meet the clinical threshold for a diabetes diagnosis, but based on expert assessment, or risk factor profiles, they are likely to develop diabetes in the near future. 
+
+Our ami is to develop a model for predictive modeling for the people who are not yet diagnose as diabetic but can develop in near future. Here We are having the class imbalance problem with only 53 are predicted diabetic cases.
+
+```{r}
+df |> 
+  count(CLASS) |> 
+  mutate(prop = prop.table(n),
+         label = glue::glue("{n} ({round(prop*100,2)}%)")) |> 
+  ggplot(aes(CLASS,prop)) +
+  geom_col(aes(fill = CLASS), show.legend = FALSE) +
+  geom_text(aes(label = label),nudge_y = .05) +
+  scale_y_continuous(labels = scales::percent_format()) +
+  labs(title = "Bar plot for showing the distribution of the response variable",
+       y = "Percentage (%)") 
+```
+Here we are showing the boxplot for the numerical predictors with respect to the predictors. As here we can see there exists significant amount of outliers for each of the continuous variable. For visualization purpose we transformed some of the predictors into log scale.
+```{r}
+df |> 
+  select(CLASS,where(is.numeric)) |> 
+  mutate_at(c("VLDL","HDL","Urea","TG","Cr"),log) |> 
+  rename_at(c("VLDL","HDL","Urea","TG","Cr"),.funs = \(x) glue::glue("{x} (log transfromed)")) |> 
+  pivot_longer(-CLASS) |> 
+  ggplot(aes(CLASS, value, fill = CLASS)) +
+  geom_boxplot(show.legend = FALSE,outlier.alpha = .1) +
+  facet_wrap(~name, scales = "free_y") +
+  labs(title = "Boxplot for showing the distribution of the predictors \nwith respecrt to the response.",
+       y = "")
+```
+
+
+```{r}
+df |> 
+  select_if(is.numeric) |> 
+  cor() |> 
+  as.data.frame() |> 
+  rownames_to_column() |> 
+  pivot_longer(-rowname) |> 
+  ggplot(aes(rowname,name, fill = value, label = round(value,2))) +
+  geom_tile() +
+  geom_text() +
+  scale_fill_gradient2(limits = c(-1,1),low = "darkred",mid = "white",high = "darkgreen") +
+  labs(title = "Correlation plot for the numerical predictors", x = "", y = "", fill = "Corr")
+```
+
+```{r}
+df |> 
+  count(Gender,CLASS) |> 
+  group_by(CLASS) ->
+  temp; temp |> 
+  bind_rows(
+    group_by(temp, Gender) |> 
+      summarise(n = sum(n),
+                CLASS = "Overall")
+  ) |> 
+  mutate(prop = prop.table(n),
+         label = glue::glue("{n} ({round(prop*100,1)}%)"),
+         CLASS = factor(x = CLASS,levels = c("N", "P", "Y", "Overall")),
+         ) |> 
+  ggplot(aes(CLASS,n, fill = Gender, label = label)) +
+  geom_col(position = "dodge") +
+  geom_text(aes(y = n + 15), position = position_dodge(width = .9),size = 3) +
+  theme(legend.position = c(.2,.8),legend.direction = "horizontal") +
+  labs(title = "Barplot for showing the distribution of the response \nwith respect to the predictor Class",
+       y = "Count")
+```
+
+This part show us which two variable pair are going to important in determine the class of the response variable.
+
+```{r}
+set.seed(1234)
+df |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("VLDL","Urea","Cr"),log) |> 
+  rename_at(c("VLDL","Urea","Cr"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |> 
+  select(-Gender) |> 
+  pivot_longer(-c(CLASS,AGE)) |> 
+  ggplot(aes(AGE, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y")
+```
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE)) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("Urea","Cr","VLDL","HDL"),log) |>
+  rename_at(c("Cr","VLDL","HDL"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |>
+  pivot_longer(-c(CLASS,Urea)) |> 
+  ggplot(aes(Urea, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y") +
+  labs(y = "",x = "Urea (Log Transfromed)")
+```
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE,Urea)) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("Cr","VLDL","HDL"),log) |>
+  rename_at(c("Cr","VLDL","HDL"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |>
+  pivot_longer(-c(CLASS,BMI)) |> 
+  ggplot(aes(BMI, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y") 
+```
+
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE,Urea,BMI)) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("Cr","VLDL","HDL"),log) |>
+  rename_at(c("Cr","VLDL","HDL"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |>
+  pivot_longer(-c(CLASS,Chol)) |> 
+  ggplot(aes(Chol, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y") 
+```
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE,Urea,BMI,Chol)) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("Cr","VLDL","HDL"),log) |>
+  rename_at(c("VLDL","HDL"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |>
+  pivot_longer(-c(CLASS,Cr)) |> 
+  ggplot(aes(Cr, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y") 
+```
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE,Urea,BMI,Chol,Cr)) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate_at(c("VLDL","HDL"),log) |>
+  rename_at(c("VLDL","HDL"),.funs = \(x) glue::glue("{x} (Log Transfromed)")) |>
+  pivot_longer(-c(CLASS,HbA1c)) |> 
+  ggplot(aes(HbA1c, value, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~name,scales = "free_y",nrow = 3, ncol = 3, drop = FALSE) 
+```
+
+
+```{r}
+set.seed(1234)
+df |> 
+  select(-c(Gender,AGE,Urea,BMI,Chol,Cr,HbA1c)) |> 
+  mutate_at(c("HDL","VLDL","TG"),log) |> 
+  rename_at(c("HDL","VLDL","TG"),.funs = \(x) glue::glue("{x}(l)")) |> 
+  group_by(CLASS) |> 
+  slice_sample(n = 100) |> 
+  mutate(id = row_number()) |> 
+  pivot_longer(-c(CLASS,id)) ->
+  temp; temp |> 
+  rename(var_x = name,x = value) |> 
+  left_join(temp,by = c("CLASS","id")) |> 
+  select(CLASS,x,y = value,var_x, var_y = name) |> 
+  filter(var_x != var_y) |> 
+  nest(-c(var_x,var_y)) |> 
+  mutate(distinct = map2_chr(.x = var_x,.y = var_y,.f = \(x,y) sort(c(x,y)) |> paste(collapse = ""))) |> 
+  distinct(distinct,.keep_all = TRUE) |> 
+  select(-distinct) |> 
+  unnest() |> 
+  mutate(facet = map2_chr(.x = var_x,.y = var_y,.f = \(x,y) glue::glue("{x} vs {y}"))
+         ) |> 
+  ggplot(aes(x,y, col = CLASS)) +
+  geom_point(alpha = .5) +
+  facet_wrap(~facet,ncol = 3, scales = "free") +
+  labs(title = "Scatter plot for X-axis variable (Var 1) vs Y-axis variable (Var 2) for \nshowing the distribution of Class",
+       x = "Var 1", y = "Var 2")
+```
+
+
+## Train Test Split
+
+We are using 75% of the data into training. That is 619 of the data set is the part of the training data and rest of the 207 observation is the part of the testing data.
+```{r}
+set.seed(1034)
+df_split <- initial_split(df,prop = .75, strata = CLASS)
+df_vfold <- vfold_cv(training(df_split),strata = CLASS)
+
+eval_mat <- metric_set(accuracy,bal_accuracy,f_meas,precision,recall,spec,sens)
+
+training(df_split) |> 
+  count(CLASS) |> 
+  mutate(train = prop.table(n)) |> 
+  rename(`n(train)` = n) |> 
+  bind_cols(
+    testing(df_split) |> 
+    count(CLASS) |> 
+    mutate(test = prop.table(n)) |> 
+    rename(`n(test)` = n) |> 
+    select(-CLASS)
+  ) |> 
+  pander::pander()
+```
+
+```{r}
+df_model <- tibble(model_config = list.files("./model/")) |> 
+  mutate(model = str_extract(string = model_config,pattern = "_.*_"),
+         model = str_remove_all(model,"_"),
+         config = str_extract(model_config,pattern = "_[a-z]+\\."),
+         config = str_remove_all(config,"\\.|_")) |> 
+  mutate(model_performance = map(.x = model_config,.f = \(model_name) {
+    model <- read_rds(here::here(".","model",model_name))
+    model |> 
+      collect_predictions() |> 
+      roc_auc(truth = CLASS,
+              c(.pred_N, .pred_P, .pred_Y), 
+              estimator = "macro_weighted") |> 
+      bind_rows(
+        collect_predictions(model) |> 
+      eval_mat(truth = CLASS,estimate = .pred_class)
+      )}
+    )) |> 
+  unnest()
+```
+
+```{r}
+df_model |> 
+   select(model,config,.metric,.estimate) |>
+  mutate(config = factor(config,c("baseline","under","over","smote","adasyn"))) |> 
+  ggplot(aes(config,.estimate,col = model)) +
+  geom_point() +
+  geom_line(aes(group = model), alpha = .5) +
+  facet_wrap(~.metric) +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 30,vjust = .9),
+        legend.position = c(.8,.05)) 
+
+ggsave(filename = "plotForModel.pdf")
+```
+
+
+
+
+
+## Multinomial Logistic Regression Model
+
+BaseLine:
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+mn_model <- multinom_reg(mode = "classification") |> set_engine("nnet")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) 
+
+temp_wf <- workflow() |> 
+  add_model(spec = mn_model) |> 
+  add_recipe(df_recipe_up) 
+
+mn_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = mn_model,file = "./model/model_mn_baseline.rds")
+```
+
+```{r}
+mn_model <- read_rds(file = "./model/model_mn_baseline.rds")
+mn_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Oversampling technique: A oversampling ratio of 0.7573054 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+mn_model <- multinom_reg(mode = "classification") |> set_engine("nnet")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |>
+  step_upsample(CLASS,over_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = mn_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(6883)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1))), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+mn_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = mn_model,file = "./model/model_mn_over.rds")
+```
+
+```{r}
+mn_model <- read_rds(file = "./model/model_mn_over.rds")
+mn_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Undersampling technique: A undersampling ratio of 2.550517 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+mn_model <- multinom_reg(mode = "classification") |> set_engine("nnet")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_downsample(CLASS,under_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = mn_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(8449)
+grid <- grid_random(x = parameters(under_ratio(range = c(1, 4))), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+mn_model <- temp_wf |> 
+  last_fit(split = df_split)
+write_rds(x = mn_model,file = "./model/model_mn_under.rds")
+```
+
+```{r}
+mn_model <- read_rds(file = "./model/model_mn_under.rds")
+mn_model |> 
+  collect_predictions() |> 
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+SMOTE technique: A oversampling ratio of 0.6198 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+mn_model <- multinom_reg(mode = "classification") |> set_engine("nnet")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_smote(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = mn_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(1391)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10))),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+mn_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = mn_model,file = "./model/model_mn_smote.rds")
+```
+
+```{r}
+mn_model <- read_rds(file = "./model/model_mn_smote.rds")
+mn_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Adasyn technique: A oversampling ratio of 0.8096134 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+mn_model <- multinom_reg(mode = "classification") |> set_engine("nnet")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_adasyn(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = mn_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(4880)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10))),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+mn_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = mn_model,file = "./model/model_mn_adasyn.rds")
+```
+
+```{r}
+mn_model <- read_rds(file = "./model/model_mn_adasyn.rds")
+mn_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Quadratic Discriminant Analysis (QDA) Model
+
+BaseLine:
+```{r eval=FALSE}
+library(discrim)
+
+plan(multisession, workers = parallel::detectCores() - 2)
+qda_model <- discrim_quad(mode = "classification") |> set_engine("MASS")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) 
+
+temp_wf <- workflow() |> 
+  add_model(spec = qda_model) |> 
+  add_recipe(df_recipe_up) 
+
+qda_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = qda_model,file = "./model/model_qda_baseline.rds")
+```
+
+```{r}
+qda_model <- read_rds(file = "./model/model_qda_baseline.rds")
+qda_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Oversampling technique: A oversampling ratio of 0.5730844 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+qda_model <- discrim_quad(mode = "classification") |> set_engine("MASS")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |>
+  step_upsample(CLASS,over_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = qda_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(6883)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1))), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+qda_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = qda_model,file = "./model/model_qda_over.rds")
+```
+
+```{r}
+qda_model <- read_rds(file = "./model/model_qda_over.rds")
+qda_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Undersampling technique: A undersampling ratio of 2.550517 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+qda_model <- discrim_quad(mode = "classification") |> set_engine("MASS")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_downsample(CLASS,under_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = qda_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(8449)
+grid <- grid_random(x = parameters(under_ratio(range = c(1, 4))), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+qda_model <- temp_wf |> 
+  last_fit(split = df_split)
+write_rds(x = qda_model,file = "./model/model_qda_under.rds")
+```
+
+```{r}
+qda_model <- read_rds(file = "./model/model_qda_under.rds")
+qda_model |> 
+  collect_predictions() |> 
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+SMOTE technique: A oversampling ratio of 0.6840928 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+qda_model <- discrim_quad(mode = "classification") |> set_engine("MASS")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_smote(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = qda_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(1391)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10))),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+qda_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = qda_model,file = "./model/model_qda_smote.rds")
+```
+
+```{r}
+qda_model <- read_rds(file = "./model/model_qda_smote.rds")
+qda_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Adasyn technique: A oversampling ratio of 0.5958284 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+qda_model <- discrim_quad(mode = "classification") |> set_engine("MASS")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_adasyn(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = qda_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(4880)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10))),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+qda_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = qda_model,file = "./model/model_qda_adasyn.rds")
+detach("package:discrim", unload = TRUE, character.only = TRUE)
+```
+
+```{r}
+qda_model <- read_rds(file = "./model/model_qda_adasyn.rds")
+qda_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+## Decision Tree Model
+
+BaseLine:
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+dt_model <- decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) 
+
+temp_wf <- workflow() |> 
+  add_model(spec = dt_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(3461)
+grid <- grid_random(x = parameters(cost_complexity(), tree_depth(), min_n()), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+dt_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = dt_model,file = "./model/model_dt_baseline.rds")
+```
+
+```{r}
+dt_model <- read_rds(file = "./model/model_dt_baseline.rds")
+dt_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Oversampling technique: A oversampling ratio of 0.5730844 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+dt_model <- decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |>
+  step_upsample(CLASS,over_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = dt_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(6883)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                            cost_complexity(), tree_depth(), min_n()),
+                     size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+dt_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = dt_model,file = "./model/model_dt_over.rds")
+```
+
+```{r}
+dt_model <- read_rds(file = "./model/model_dt_over.rds")
+dt_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Undersampling technique: A undersampling ratio of 2.527191 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+dt_model <- decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_downsample(CLASS,under_ratio = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = dt_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(8449)
+grid <- grid_random(x = parameters(under_ratio(range = c(1, 4)), cost_complexity(), tree_depth(), min_n()), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+dt_model <- temp_wf |> 
+  last_fit(split = df_split)
+write_rds(x = dt_model,file = "./model/model_dt_under.rds")
+```
+
+```{r}
+dt_model <- read_rds(file = "./model/model_dt_under.rds")
+dt_model |> 
+  collect_predictions() |> 
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+SMOTE technique: A oversampling ratio of 0.6102712 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+dt_model <- decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_smote(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = dt_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(1391)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10)),
+                                   cost_complexity(), tree_depth(), min_n()),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+dt_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = dt_model,file = "./model/model_dt_smote.rds")
+```
+
+```{r}
+dt_model <- read_rds(file = "./model/model_dt_smote.rds")
+dt_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Adasyn technique: A oversampling ratio of 0.5040007 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+dt_model <- decision_tree(mode = "classification", cost_complexity = tune(), tree_depth = tune(), min_n = tune()) |> set_engine("rpart")
+
+
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_adasyn(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+temp_wf <- workflow() |> 
+  add_model(spec = dt_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(4880)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10)),
+                                   cost_complexity(), tree_depth(), min_n()),
+                     size = 15)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+dt_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = dt_model,file = "./model/model_dt_adasyn.rds")
+```
+
+```{r}
+dt_model <- read_rds(file = "./model/model_dt_adasyn.rds")
+dt_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+## Random Forest Model
+
+BaseLine:
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+rf_model <- rand_forest(mode = "classification",min_n = tune(),mtry = tune(),trees = 500) |> set_engine("ranger", importance = "impurity")
+  
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) 
+
+
+temp_wf <- workflow() |> 
+  add_model(spec = rf_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(3461)
+grid <- grid_random(x = parameters(mtry(c(2,8)), min_n()),size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+rf_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = rf_model,file = "./model/model_rf_baseline.rds")
+```
+
+
+```{r}
+rf_model <- read_rds(file = "./model/model_rf_baseline.rds")
+rf_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Oversampling technique: A oversampling ration of 0.5185252 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+rf_model <- rand_forest(mode = "classification",min_n = tune(),mtry = tune(),trees = 1500) |> set_engine("ranger", importance = "impurity")
+  
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |>
+  step_upsample(CLASS,over_ratio = tune(),seed = 6883)
+
+
+temp_wf <- workflow() |> 
+  add_model(spec = rf_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(6883)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                            mtry(c(2,8)),
+                            min_n()),
+                     size = 10
+             )
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE),metrics = metric_set(roc_auc))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+rf_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = rf_model,file = "./model/model_rf_over.rds")
+```
+
+
+```{r}
+rf_model <- read_rds(file = "./model/model_rf_over.rds")
+rf_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Undersampling technique: A undersampling ration of 3.637225 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+rf_model <- rand_forest(mode = "classification",min_n = tune(),mtry = tune(),trees = 1500)
+  
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_downsample(CLASS,under_ratio = tune(),seed = 6883)
+
+
+temp_wf <- workflow() |> 
+  add_model(spec = rf_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(8449)
+grid <- grid_random(x = parameters(under_ratio(range = c(1, 4)), mtry(c(2, 8)), min_n(c(10, 30))), size = 10)
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+rf_model <- temp_wf |> 
+  last_fit(split = df_split)
+write_rds(x = rf_model,file = "./model/model_rf_under.rds")
+```
+
+
+```{r}
+rf_model <- read_rds(file = "./model/model_rf_under.rds")
+rf_model |> 
+  collect_predictions() |> 
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+SMOTE technique: A oversampling ration of 0.7719129 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+rf_model <- rand_forest(mode = "classification",min_n = tune(),mtry = tune(),trees = 1500)
+  
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_smote(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+
+temp_wf <- workflow() |> 
+  add_model(spec = rf_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(1391)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10)),
+                                   mtry(c(2,8)),
+                                   min_n()),
+                     size = 15
+             )
+
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+rf_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = rf_model,file = "./model/model_rf_smote.rds")
+```
+
+
+```{r}
+rf_model <- read_rds(file = "./model/model_rf_smote.rds")
+rf_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+Adasyn technique: A oversampling ration of 0.7719129 is selected as the optimal.
+
+```{r eval=FALSE}
+plan(multisession, workers = parallel::detectCores() - 2)
+
+rf_model <- rand_forest(mode = "classification",min_n = tune(),mtry = tune(),trees = 1500)
+  
+df_recipe_up <- recipe(x = training(df_split),formula = CLASS ~ .) |> 
+  step_string2factor(CLASS,Gender) |> 
+  step_dummy(Gender) |> 
+  step_range(all_numeric_predictors()) |> 
+  step_adasyn(CLASS,over_ratio = tune(),neighbors = tune(),seed = 6883)
+
+
+temp_wf <- workflow() |> 
+  add_model(spec = rf_model) |> 
+  add_recipe(df_recipe_up) 
+
+set.seed(4880)
+grid <- grid_random(x = parameters(over_ratio(range = c(.5,1)),
+                                   neighbors(c(2,10)),
+                                   mtry(c(2,8)),
+                                   min_n()),
+                     size = 15
+             )
+
+
+grid_result <- tune_grid(object = temp_wf,resamples = df_vfold,grid = grid,control = control_grid(verbose = TRUE,save_pred = TRUE))
+
+temp_wf <- temp_wf |> 
+  finalize_workflow(parameters = select_best(grid_result))
+
+rf_model <- temp_wf |> 
+  last_fit(split = df_split)
+
+write_rds(x = rf_model,file = "./model/model_rf_adasyn.rds")
+```
+
+
+```{r}
+rf_model <- read_rds(file = "./model/model_rf_adasyn.rds")
+rf_model |> 
+  collect_predictions() |>
+  conf_mat(truth = CLASS,estimate = .pred_class)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
